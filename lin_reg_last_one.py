@@ -1,39 +1,48 @@
-import itertools
+# ================================================================
+# FedAVOT vs FedAvg(K) vs FedAvg(full) on MNIST (Generic K, Monte Carlo q from r)
+# + normalized FedAvg(K): weights p_i / sum_{j in S} p_j
+# Colors: FedAVOT=blue, FedAvg(K)=orange, normalized FedAvg(K)=green, FedAvg(full)=red
+# ================================================================
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 from itertools import combinations
-from sklearn.datasets import make_regression
-from sklearn.metrics import mean_squared_error
+from sklearn.datasets import fetch_openml
 from sklearn.preprocessing import StandardScaler
 
-# ================================================================
-# Config (feel free to tweak)
-# ================================================================
+# -----------------------------
+# Experiment Configuration
+# -----------------------------
 NUM_USERS = 100
-K = 2                 # <- generic subset size
-ROUNDS = 2000               # make 2k if you want; 1k is faster to iterate
-LOCAL_EPOCHS = 5            # local steps per selection
-DIM = 100
-SAMPLES_PER_USER = 3000 // NUM_USERS
-LR = 0.01
-SEEDS = [0, 1, 2, 3, 4]     # five seeds
-NUM_SAMPLES_FOR_Q = 1_000_000   # Monte Carlo to estimate q over K-subsets
+NUM_CLASSES = 10
+K = 2                          # generic K (size of each participating subset)
+ROUNDS = 2000                  # 2000 is fine too; 1000 for quicker runs
+LOCAL_EPOCHS = 3               # local steps per selection
+DIM = 784
+TOTAL_SAMPLES = 3000           # total examples used from MNIST
+SAMPLES_PER_USER = TOTAL_SAMPLES // NUM_USERS
+LR = 0.1
+SEEDS = [0, 1, 2, 3, 4]        # replicate for mean±std
+IPFP_TOL = 1e-10
+IPFP_MAX_ITERS = 4000
+NUM_SAMPLES_FOR_Q = 1_000_000  # MC draws to estimate q over K-subsets
 seed=0
-IPFP_TOL = 1e-12
-IPFP_MAX_ITERS = 10000
+
+# -----------------------------
+# Fetch & preprocess MNIST once
+# -----------------------------
+mnist = fetch_openml("mnist_784", version=1, as_frame=False)
+X_full, y_full = mnist.data[:TOTAL_SAMPLES] / 255.0, mnist.target.astype(int)[:TOTAL_SAMPLES]
+X_full = StandardScaler().fit_transform(X_full)
 
 # ================================================================
-# Utilities: masked IPFP (unchanged in spirit, generalized for any K)
+# Masked IPFP on an arbitrary K-subset family (1-based subset tuples)
 # ================================================================
 def build_mask(n, subsets):
-    """
-    Boolean mask M (n x m) with 1-based subset entries:
-    M[i, j] = True iff (i+1) is in subset j; rows are 0..n-1, subsets are tuples in {1,..,n}.
-    """
     m = len(subsets)
     M = np.zeros((n, m), dtype=bool)
     for j, Aj in enumerate(subsets):
-        for i in Aj:       # i is 1..n
+        for i in Aj:       # i in 1..n
             M[i-1, j] = True
     return M
 
@@ -66,7 +75,6 @@ def ipfp_masked(p, q, M, tol=1e-10, max_iter=10000, verbose=False):
     p = np.asarray(p, dtype=float)
     q = np.asarray(q, dtype=float)
     n, m = M.shape
-
     if p.ndim != 1 or q.ndim != 1:
         raise ValueError("p and q must be 1D arrays")
     if not np.all(p >= 0) or not np.all(q >= 0):
@@ -111,7 +119,7 @@ def ipfp_masked(p, q, M, tol=1e-10, max_iter=10000, verbose=False):
 
         row_err = np.linalg.norm(Y.sum(axis=1) - p, ord=1)
         col_err = np.linalg.norm(Y.sum(axis=0) - q, ord=1)
-        if verbose and it % 100 == 0:
+        if verbose and it % 200 == 0:
             print(f"[{it}] row_err={row_err:.3e}, col_err={col_err:.3e}")
         if max(row_err, col_err) <= tol:
             return Y, {"iters": it+1, "row_err": row_err, "col_err": col_err}
@@ -158,7 +166,7 @@ def solve_T_with_given_subsets(p, q, subsets, tol=1e-10, max_iter=10000, verbose
     if q.size != m:
         raise ValueError(f"Length of q ({q.size}) must equal number of subsets ({m}).")
 
-    M = build_mask(n, subsets)  # 1-based subsets
+    M = build_mask(n, subsets)  # 1-based
     if abs(p.sum() - q.sum()) > 1e-12:
         p = p / p.sum()
         q = q / q.sum()
@@ -173,11 +181,8 @@ def solve_T_with_given_subsets(p, q, subsets, tol=1e-10, max_iter=10000, verbose
     return T, subsets, M, info
 
 def column_users_and_weights(T, subsets, j):
-    """
-    Return (0-based user ids, normalized weights) for column j (subset of size K).
-    """
     Aj_1 = subsets[j]                      # 1-based subset tuple
-    rows = np.array([i-1 for i in Aj_1])   # to 0-based
+    rows = np.array([i-1 for i in Aj_1])   # to 0-based indices
     w = T[rows, j]
     s = w.sum()
     if s <= 0 or not np.isfinite(s):
@@ -187,60 +192,32 @@ def column_users_and_weights(T, subsets, j):
     return rows, w
 
 # ================================================================
-# Linear regression helpers
-# ================================================================
-def local_train_lr(X, y, w_init, epochs=1, lr=0.01):
-    w = w_init.copy()
-    n = len(y)
-    for _ in range(epochs):
-        preds = X @ w
-        grad = (X.T @ (preds - y)) / n
-        w -= lr * grad
-    return w
-
-def global_weighted_mse(w, user_data, p):
-    tot = 0.0
-    for i, (Xi, yi) in enumerate(user_data):
-        preds = Xi @ w
-        loss = mean_squared_error(yi, preds)
-        tot += p[i] * loss
-    return tot
-
-# ================================================================
-# Build skewed p, r and K-subsets; estimate q via Monte Carlo
+# Distributions and subset family helpers
 # ================================================================
 def make_skew_distributions(N):
     idx_1 = np.arange(1, N + 1, dtype=float)
-    # r_i ∝ exp(+i) (prior for availability)
-    r = np.power(idx_1, .8)
+    # r_i ∝ exp(+i) (availability prior)
+    r = np.ones(N)
     r /= r.sum()
-    # p_i ∝ exp(-i) (importance for objective)
-    p = np.power(idx_1[::-1], .8)
+    # p_i ∝ exp(-i) (importance)
+    p = np.power(idx_1[::-1], 4)
     p /= p.sum()
+    print(r)
+    print(p)
     return p, r
 
 def all_K_subsets_1based(N, K):
     return [tuple(c) for c in combinations(range(1, N + 1), K)]
 
 def estimate_q_by_mc(subsets, r, N, K, num_samples=1_000_000, rng=None):
-    """
-    Estimate q over the provided 'subsets' (1-based tuples of size K)
-    by Monte Carlo: S ~ Choice(N, K, p=r, replace=False).
-    Efficiently tallies unique rows using np.unique.
-    """
     if rng is None:
         rng = np.random.RandomState(0)
-    # map subset tuple -> index
     subset_to_idx = {s: j for j, s in enumerate(subsets)}
-    # sample many subsets
     draws = rng.choice(N, size=(num_samples, K), replace=True, p=r)
-    draws.sort(axis=1)  # canonical order
-    # convert to 1-based to match 'subsets'
+    draws.sort(axis=1)
     draws_1b = draws + 1
-    # unique counts
     uniq, counts = np.unique(draws_1b, axis=0, return_counts=True)
     q_counts = np.zeros(len(subsets), dtype=np.int64)
-    # assign counts to indices
     for row, c in zip(uniq, counts):
         tup = tuple(row.tolist())
         j = subset_to_idx.get(tup, None)
@@ -251,7 +228,66 @@ def estimate_q_by_mc(subsets, r, N, K, num_samples=1_000_000, rng=None):
     return q
 
 # ================================================================
-# Main experiment: FedAVOT(K) vs FedAvg(K, EXACT) vs FedAvg(full)
+# Multinomial logistic regression (NumPy)
+# ================================================================
+def init_theta(d, C):
+    return {"W": np.zeros((d, C)), "b": np.zeros(C)}
+
+def softmax(z):
+    z = z - np.max(z, axis=1, keepdims=True)
+    e = np.exp(z)
+    return e / np.sum(e, axis=1, keepdims=True)
+
+def forward(X, theta):
+    return X @ theta["W"] + theta["b"]
+
+def ce_loss_and_grad(X, y, theta, l2=0.0):
+    n, d = X.shape
+    C = theta["W"].shape[1]
+    scores = forward(X, theta)
+    P = softmax(scores)
+    Y = np.zeros((n, C))
+    Y[np.arange(n), y] = 1.0
+    eps = 1e-12
+    loss = -np.sum(Y * np.log(P + eps)) / n
+    loss += 0.5 * l2 * np.sum(theta["W"] ** 2)
+    G = (P - Y) / n
+    dW = X.T @ G + l2 * theta["W"]
+    db = np.sum(G, axis=0)
+    return loss, {"W": dW, "b": db}
+
+def local_train(theta, X, y, epochs=1, lr=0.1, l2=0.0):
+    th = {"W": theta["W"].copy(), "b": theta["b"].copy()}
+    for _ in range(epochs):
+        _, grads = ce_loss_and_grad(X, y, th, l2=l2)
+        th["W"] -= lr * grads["W"]
+        th["b"] -= lr * grads["b"]
+    return th
+
+def weighted_average_thetas(thetas, weights):
+    W = np.sum([w * t["W"] for t, w in zip(thetas, weights)], axis=0)
+    b = np.sum([w * t["b"] for t, w in zip(thetas, weights)], axis=0)
+    return {"W": W, "b": b}
+
+def global_loss(theta, user_data, p, l2=0.0):
+    tot = 0.0
+    for i, (Xi, yi) in enumerate(user_data):
+        li, _ = ce_loss_and_grad(Xi, yi, theta, l2=l2)
+        tot += p[i] * li
+    return tot
+
+# ================================================================
+# Data partitioning
+# ================================================================
+def make_user_data(X_full, y_full, N):
+    perm = np.random.permutation(len(X_full))
+    X = X_full[perm]
+    y = y_full[perm]
+    return [(X[i*SAMPLES_PER_USER:(i+1)*SAMPLES_PER_USER],
+             y[i*SAMPLES_PER_USER:(i+1)*SAMPLES_PER_USER]) for i in range(N)]
+
+# ================================================================
+# Run the methods per seed
 # ================================================================
 all_losses_FedAVOT = []
 all_losses_faK   = []
@@ -261,166 +297,133 @@ print(f"\n[Seed {seed}]  (K={K})")
 rng = np.random.RandomState(seed)
 np.random.seed(seed)
 
-# --- Data ---
-X_full, y_full = make_regression(n_samples=3000, n_features=DIM, noise=0.1, random_state=seed)
-X_full = StandardScaler().fit_transform(X_full)
+# user datasets
+user_data = make_user_data(X_full, y_full, NUM_USERS)
 
-# --- Partition to users ---
-perm = np.random.permutation(len(X_full))
-X = X_full[perm]
-y = y_full[perm]
-user_data = [
-    (X[i * SAMPLES_PER_USER:(i + 1) * SAMPLES_PER_USER],
-        y[i * SAMPLES_PER_USER:(i + 1) * SAMPLES_PER_USER])
-    for i in range(NUM_USERS)
-]
-
-# --- Distributions and subset family ---
+# skewed p and r
 p, r = make_skew_distributions(NUM_USERS)
-subsets_K = all_K_subsets_1based(NUM_USERS, K)
-print(f"  Total subsets of size K: C({NUM_USERS},{K}) = {len(subsets_K)}")
 
-# --- Estimate q via Monte Carlo sampling from r ---
+# K-subsets and q via Monte Carlo from r
+subsets_K = all_K_subsets_1based(NUM_USERS, K)
+print(f"  Total subsets size K: C({NUM_USERS},{K}) = {len(subsets_K)}")
 q = estimate_q_by_mc(subsets_K, r, NUM_USERS, K, num_samples=NUM_SAMPLES_FOR_Q, rng=rng)
 
-# --- Solve T via masked IPFP for this subset family and q ---
+# Solve T for this family
 T, subsets_used, M_mask, info = solve_T_with_given_subsets(
     p, q, subsets_K, tol=IPFP_TOL, max_iter=IPFP_MAX_ITERS, verbose=False
 )
 print(f"  IPFP iters={info.get('iters')} | T col err∞={info.get('T_col_err_inf'):.2e} | p match err∞={info.get('p_match_err_inf'):.2e}")
 
-
-
 for seed in SEEDS:
-    
     print(f"\n[Seed {seed}]  (K={K})")
     rng = np.random.RandomState(seed)
     np.random.seed(seed)
-    # --- Initialize globals for the three methods ---
-    d = user_data[0][0].shape[1]
-    w_FedAVOT = np.zeros(d)
-    w_faK   = np.zeros(d)
-    w_full  = np.zeros(d)
 
-    losses_ot   = []
-    losses_faK  = []
-    losses_full = []
+    # initialize global models
+    theta_FedAVOT   = init_theta(DIM, NUM_CLASSES)
+    theta_faK     = init_theta(DIM, NUM_CLASSES)
+    theta_full    = init_theta(DIM, NUM_CLASSES)
 
-    q_cum = np.cumsum(q)
+    losses_ot, losses_faK, losses_full = [], [], []
 
-    # --- Precompute local data references for speed ---
+    # Precompute for speed
     Xs = [ud[0] for ud in user_data]
     ys = [ud[1] for ud in user_data]
+    q_cum = np.cumsum(q)
 
-    # --- Training loop ---
-    for r_idx in range(ROUNDS):
-        # sample a subset j ~ q
+    for t in range(ROUNDS):
+        # sample subset j ~ q
         u = rng.random()
         j = int(np.searchsorted(q_cum, u, side="right"))
-
-        # members of subset j for this round
-        users_S, weights_T = column_users_and_weights(T, subsets_used, j)  # length K
+        users_S, weights_T = column_users_and_weights(T, subsets_used, j)  # indices (0-based) and normalized weights
 
         # ------------------ FedAVOT(K) ------------------
-        local_models_ot = []
+        local_thetas = []
         for uid in users_S:
-            theta_i = local_train_lr(Xs[uid], ys[uid], w_FedAVOT, epochs=LOCAL_EPOCHS, lr=LR)
-            local_models_ot.append(theta_i)
-        # convex combination by T column weights
-        w_next_ot = np.zeros_like(w_FedAVOT)
-        for coeff, theta in zip(weights_T, local_models_ot):
-            w_next_ot += coeff * theta
-        w_FedAVOT = w_next_ot
-        losses_ot.append(global_weighted_mse(w_FedAVOT, user_data, p))
+            ti = local_train(theta_FedAVOT, Xs[uid], ys[uid], epochs=LOCAL_EPOCHS, lr=LR, l2=0.0)
+            local_thetas.append(ti)
+        theta_FedAVOT = weighted_average_thetas(local_thetas, weights_T)
+        losses_ot.append(global_loss(theta_FedAVOT, user_data, p, l2=0.0))
 
-        # ---------------- FedAvg(K), EXACT: sum_{i in S} (N/K)*p_i * theta_i ----------------
-        local_models_faK = []
+        # ---------------- FedAvg(K) EXACT: sum_{i in S} (N/K)*p_i * theta_i ----------------
+        local_thetas_fak = []
         for uid in users_S:
-            theta_i = local_train_lr(Xs[uid], ys[uid], w_faK, epochs=LOCAL_EPOCHS, lr=LR)
-            local_models_faK.append((uid, theta_i))
-        w_next_faK = np.zeros_like(w_faK)
+            ti = local_train(theta_faK, Xs[uid], ys[uid], epochs=LOCAL_EPOCHS, lr=LR, l2=0.0)
+            local_thetas_fak.append((uid, ti))
         scale = NUM_USERS / float(K)
-        # pees = np.asarray(list(p[uid] for (uid, theta_i) in local_models_faK)).sum()
-        # scale = pees
-        for uid, theta_i in local_models_faK:
-            w_next_faK += (p[uid] * scale) * theta_i
-            # w_next_faK += (p[uid] / scale) * theta_i
-        w_faK = w_next_faK
-        losses_faK.append(global_weighted_mse(w_faK, user_data, p))
+        # weighted sum without normalization (EXACT rule)
+        W_acc = np.zeros_like(theta_faK["W"])
+        b_acc = np.zeros_like(theta_faK["b"])
+        for uid, ti in local_thetas_fak:
+            coeff = p[uid] * scale
+            W_acc += coeff * ti["W"]
+            b_acc += coeff * ti["b"]
+        theta_faK = {"W": W_acc, "b": b_acc}
+        losses_faK.append(global_loss(theta_faK, user_data, p, l2=0.0))
+
 
         # ---------------- FedAvg (full): sum_i p_i * theta_i ----------------
-        local_models_full = []
+        W_acc = np.zeros_like(theta_full["W"])
+        b_acc = np.zeros_like(theta_full["b"])
         for uid in range(NUM_USERS):
-            theta_i = local_train_lr(Xs[uid], ys[uid], w_full, epochs=LOCAL_EPOCHS, lr=LR)
-            local_models_full.append((uid, theta_i))
-        w_next_full = np.zeros_like(w_full)
-        for uid, theta_i in local_models_full:
-            w_next_full += p[uid] * theta_i
-        w_full = w_next_full
-        losses_full.append(global_weighted_mse(w_full, user_data, p))
+            ti = local_train(theta_full, Xs[uid], ys[uid], epochs=LOCAL_EPOCHS, lr=LR, l2=0.0)
+            W_acc += p[uid] * ti["W"]
+            b_acc += p[uid] * ti["b"]
+        theta_full = {"W": W_acc, "b": b_acc}
+        losses_full.append(global_loss(theta_full, user_data, p, l2=0.0))
 
-        if (r_idx + 1) % 200 == 0:
-            print(f"  Round {r_idx+1}/{ROUNDS}: FedAVOT={losses_ot[-1]:.6f} | "
-                  f"FedAvg(K)={losses_faK[-1]:.6f} | FedAvg(full)={losses_full[-1]:.6f}")
+        if (t + 1) % 200 == 0:
+            print(f"  round {t+1}/{ROUNDS}  FedAVOT={losses_ot[-1]:.4f} | "
+                  f"FedAvg(K)={losses_faK[-1]:.4f} | "
+                  f"FedAvg(full)={losses_full[-1]:.4f}")
 
     all_losses_FedAVOT.append(np.array(losses_ot))
     all_losses_faK.append(np.array(losses_faK))
     all_losses_full.append(np.array(losses_full))
 
 # ================================================================
-# Aggregate across seeds
+# Aggregate and plot (loss curves + p/r bars)
 # ================================================================
-all_losses_FedAVOT = np.vstack(all_losses_FedAVOT)
-all_losses_faK   = np.vstack(all_losses_faK)
-all_losses_full  = np.vstack(all_losses_full)
+L_ot    = np.vstack(all_losses_FedAVOT)
+L_faK   = np.vstack(all_losses_faK)
+L_full  = np.vstack(all_losses_full)
 
-loss_FedAVOT_mean = all_losses_FedAVOT.mean(axis=0)
-loss_FedAVOT_std  = all_losses_FedAVOT.std(axis=0)
+mean_ot,   std_ot   = L_ot.mean(axis=0),   L_ot.std(axis=0)
+mean_faK,  std_faK  = L_faK.mean(axis=0),  L_faK.std(axis=0)
+mean_full, std_full = L_full.mean(axis=0), L_full.std(axis=0)
 
-loss_faK_mean = all_losses_faK.mean(axis=0)
-loss_faK_std  = all_losses_faK.std(axis=0)
-
-loss_full_mean = all_losses_full.mean(axis=0)
-loss_full_std  = all_losses_full.std(axis=0)
-
-# For the bar plots (use last-seed p and r — they are deterministic anyway)
+# p and r (deterministic functions of N)
 p, r = make_skew_distributions(NUM_USERS)
-
-# ================================================================
-# Plot: loss curves + bars for p and r
-# Colors: FedAVOT=blue, FedAvg(K)=orange, FedAvg(full)=red
-# ================================================================
-import matplotlib.gridspec as gridspec
 
 fig = plt.figure(figsize=(12, 8))
 gs = gridspec.GridSpec(2, 2, height_ratios=[2.2, 1.0])
 
-# --- (1) Loss curves (span top row) ---
+# --- Top row: loss curves
 ax0 = fig.add_subplot(gs[0, :])
 x = np.arange(ROUNDS)
 
-ax0.plot(x, loss_FedAVOT_mean, label=f"FedAVOT (K={K})", color="tab:blue", linewidth=1.8)
-ax0.fill_between(x, loss_FedAVOT_mean - loss_FedAVOT_std, loss_FedAVOT_mean + loss_FedAVOT_std,
-                 alpha=0.15, color="tab:blue")
+# FedAVOT (blue)
+ax0.plot(x, mean_ot, label=f"FedAVOT (K={K})", color="tab:blue", linewidth=1.8)
+ax0.fill_between(x, mean_ot - std_ot, mean_ot + std_ot, alpha=0.15, color="tab:blue")
 
-ax0.plot(x, loss_faK_mean, label=f"FedAvg (K={K})", color="tab:orange", linewidth=1.8)
-ax0.fill_between(x, loss_faK_mean - loss_faK_std, loss_faK_mean + loss_faK_std,
-                 alpha=0.15, color="tab:orange")
+# FedAvg(K) (orange)
+ax0.plot(x, mean_faK, label=f"FedAvg (K={K})", color="tab:orange", linewidth=1.8)
+ax0.fill_between(x, mean_faK - std_faK, mean_faK + std_faK, alpha=0.15, color="tab:orange")
 
-ax0.plot(x, loss_full_mean, label="FedAvg (full devices)", color="tab:red", linewidth=1.8)
-ax0.fill_between(x, loss_full_mean - loss_full_std, loss_full_mean + loss_full_std,
-                 alpha=0.15, color="tab:red")
+# FedAvg (full) (red)
+ax0.plot(x, mean_full, label="FedAvg (full devices)", color="tab:red", linewidth=1.8)
+ax0.fill_between(x, mean_full - std_full, mean_full + std_full, alpha=0.15, color="tab:red")
 
-# --- (1) Loss plot ---
-ax0.set_yscale("log")  # optional
+# --- Top: Loss plot
+# ax0.set_yscale("log")  # optional
 ax0.set_xlabel("Communication round", fontsize=14)
-ax0.set_ylabel(r"Global loss MSE loss - Log Scale", fontsize=14)
-ax0.set_title(f"Linear Regression — FedAVOT vs FedAvg (K={K}) vs FedAvg(full) — mean ± std over {len(SEEDS)} seeds", fontsize=14)
+ax0.set_ylabel(r"Global Cross Entropy Loss", fontsize=14)
+ax0.set_title(f"MNIST — FedAVOT vs FedAvg (K={K}) vs FedAvg(full) — mean ± std over {len(SEEDS)} seeds", fontsize=14)
 ax0.tick_params(axis="both", which="major", labelsize=18)
 ax0.grid(True, alpha=0.3, which="both", linestyle="--")
-ax0.legend(fontsize=14)  # make legend larger
+ax0.legend(fontsize=14)
 
-# --- (2) Bar plot for p ---
+# --- Bottom left: p bar plot
 ax1 = fig.add_subplot(gs[1, 0])
 ax1.bar(np.arange(1, NUM_USERS+1), p, color="gray", edgecolor="black", linewidth=0.6)
 ax1.set_title("Importance Distribution $p$", fontsize=14)
@@ -429,16 +432,16 @@ ax1.set_ylabel("p", fontsize=14)
 ax1.tick_params(axis="both", which="major", labelsize=18)
 ax1.grid(axis="y", alpha=0.3)
 
-# --- (3) Bar plot for r ---
+# --- Bottom right: r bar plot
 ax2 = fig.add_subplot(gs[1, 1])
 ax2.bar(np.arange(1, NUM_USERS+1), r, color="gray", edgecolor="black", linewidth=0.6)
-ax2.set_title("Availability Distribution $r", fontsize=14)
+ax2.set_title("Selection Distribution $r$", fontsize=14)
 ax2.set_xlabel("User index", fontsize=14)
 ax2.set_ylabel("r", fontsize=14)
 ax2.tick_params(axis="both", which="major", labelsize=18)
 ax2.grid(axis="y", alpha=0.3)
 
 plt.tight_layout()
-plt.savefig(f"linreg_K{K}_FedAVOT_vs_FedAvg_full_with_priors.png", dpi=300, bbox_inches="tight")
-plt.savefig(f"linreg_K{K}_FedAVOT_vs_FedAvg_full_with_priors.pdf", bbox_inches="tight")
+plt.savefig(f"mnist_K{K}_FedAVOT_vs_FedAvg_full_with_priors_and_normalized.png", dpi=300, bbox_inches="tight")
+plt.savefig(f"mnist_K{K}_FedAVOT_vs_FedAvg_full_with_priors_and_normalized.pdf", bbox_inches="tight")
 plt.show()
